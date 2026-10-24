@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Ticket;
+use App\Services\TicketHistoryService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -85,8 +86,10 @@ class TicketController extends Controller
     /**
      * Crear un ticket para la empresa del usuario autenticado.
      */
-    public function store(Request $request): JsonResponse
-    {
+    public function store(
+        Request $request,
+        TicketHistoryService $historyService
+    ): JsonResponse {
         if (!$this->companyIsActive($request)) {
             return response()->json([
                 'message' => 'El usuario no pertenece a una empresa activa.',
@@ -151,7 +154,11 @@ class TicketController extends Controller
 
         $validated = $request->validate($rules);
 
-        $ticket = DB::transaction(function () use ($validated, $user) {
+        $ticket = DB::transaction(function () use (
+            $validated,
+            $user,
+            $historyService
+        ) {
             $ticket = new Ticket();
 
             // La empresa y el solicitante vienen del usuario autenticado.
@@ -175,6 +182,7 @@ class TicketController extends Controller
 
             $ticket->save();
 
+            // Asignar el número definitivo al ticket.
             $ticket->ticket_number = sprintf(
                 'INC-%s-%06d',
                 now()->format('Y'),
@@ -182,6 +190,9 @@ class TicketController extends Controller
             );
 
             $ticket->save();
+
+            // Registrar la creación en la misma transacción.
+            $historyService->recordCreated($ticket, $user);
 
             return $ticket;
         });
@@ -224,10 +235,13 @@ class TicketController extends Controller
     }
 
     /**
-     * Actualizar un ticket dentro de la empresa.
+     * Actualizar un ticket y registrar los cambios reales.
      */
-    public function update(Request $request, int $id): JsonResponse
-    {
+    public function update(
+        Request $request,
+        int $id,
+        TicketHistoryService $historyService
+    ): JsonResponse {
         if (!$this->companyIsActive($request)) {
             return response()->json([
                 'message' => 'El usuario no pertenece a una empresa activa.',
@@ -306,7 +320,48 @@ class TicketController extends Controller
             }
         }
 
-        $ticket->save();
+        // Identificar los cambios antes de guardar.
+        $auditableFields = [
+            'assigned_to',
+            'title',
+            'description',
+            'category',
+            'priority',
+            'status',
+            'due_at',
+            'resolved_at',
+        ];
+
+        $changes = [];
+
+        foreach ($ticket->getDirty() as $field => $newValue) {
+            if (!in_array($field, $auditableFields, true)) {
+                continue;
+            }
+
+            $changes[$field] = [
+                $ticket->getOriginal($field),
+                $ticket->getAttribute($field),
+            ];
+        }
+
+        // Guardar el ticket y su historial de forma atómica.
+        DB::transaction(function () use (
+            $ticket,
+            $user,
+            $changes,
+            $historyService
+        ) {
+            $ticket->save();
+
+            if ($changes !== []) {
+                $historyService->recordChanges(
+                    $ticket,
+                    $user,
+                    $changes
+                );
+            }
+        });
 
         return response()->json([
             'message' => 'Ticket actualizado correctamente.',
